@@ -1,0 +1,138 @@
+name: Build Unlocked SiYuan Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SiYuan Release Tag (e.g. v3.8.6)'
+        required: true
+        default: 'v3.8.6'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_os }} (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target_os: linux
+            goos: linux
+            goarch: amd64
+            binary_name: SiYuan-Kernel
+            cc: gcc
+          - target_os: windows
+            goos: windows
+            goarch: amd64
+            binary_name: SiYuan-Kernel.exe
+            cc: x86_64-w64-mingw32-gcc
+
+    steps:
+      - name: Checkout SiYuan Source
+        uses: actions/checkout@v4
+        with:
+          repository: 'siyuan-note/siyuan'
+          ref: ${{ github.event.inputs.version }}
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+          cache-dependency-path: 'kernel/go.sum'
+
+      - name: Install Windows Cross-Compile Toolchain
+        if: matrix.target_os == 'windows'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Apply VIP & WebDAV Unlock Patch
+        run: |
+          python3 - << 'EOF'
+          import re
+
+          conf_path = "kernel/model/conf.go"
+          with open(conf_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          # 1. 穿透 IsSubscriber
+          content = re.sub(
+              r'func IsSubscriber\(\) bool \{[\s\S]*?\n\}',
+              'func IsSubscriber() bool {\n\treturn true\n}',
+              content
+          )
+
+          # 2. 穿透 IsPaidUser (精确匹配到紧随其后的 const 声明，避免嵌套大括号过早截断)
+          content = re.sub(
+              r'func IsPaidUser\(\) bool \{[\s\S]*?\n\}\n\nconst \(',
+              'func IsPaidUser() bool {\n\treturn true\n}\n\nconst (',
+              content
+          )
+
+          # 3. 拦截 GetUser 方法注入永久 VIP 实体 (接收器重命名为 c 避免遮蔽 package conf 命名空间)
+          user_patch = """func (c *AppConf) GetUser() *conf.User {
+          \tc.userLock.Lock()
+          \tdefer c.userLock.Unlock()
+          \tif c.User == nil {
+          \t\tc.User = &conf.User{
+          \t\t\tUserId: "1",
+          \t\t\tUserName: "LocalVIP",
+          \t\t\tUserSiYuanProExpireTime: -1,
+          \t\t\tUserSiYuanSubscriptionStatus: 0,
+          \t\t\tUserSiYuanSubscriptionPlan: 0,
+          \t\t\tUserSiYuanSubscriptionType: 1,
+          \t\t\tUserSiYuanOneTimePayStatus: 1,
+          \t\t}
+          \t} else {
+          \t\tc.User.UserSiYuanProExpireTime = -1
+          \t\tc.User.UserSiYuanSubscriptionStatus = 0
+          \t\tc.User.UserSiYuanOneTimePayStatus = 1
+          \t}
+          \treturn c.User
+          }"""
+
+          content = re.sub(
+              r'func \(conf \*AppConf\) GetUser\(\) \*conf\.User \{[\s\S]*?\n\}',
+              user_patch,
+              content
+          )
+
+          with open(conf_path, "w", encoding="utf-8") as f:
+              f.write(content)
+
+          print("Successfully applied VIP & WebDAV unlock patches.")
+          EOF
+
+      - name: Verify Patches
+        run: |
+          git diff kernel/model/conf.go
+
+      - name: Compile Kernel
+        working-directory: kernel
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
+        run: |
+          go build -tags "fts5 sqlcipher" -ldflags "-s -w" -o "${{ matrix.binary_name }}" main.go
+
+      - name: Package Artifact
+        run: |
+          mkdir -p dist
+          mv kernel/${{ matrix.binary_name }} dist/
+          cd dist
+          tar -czf "${{ matrix.binary_name }}-${{ matrix.target_os }}-${{ matrix.goarch }}-${{ github.event.inputs.version }}.tar.gz" "${{ matrix.binary_name }}"
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}-unlocked
+          name: SiYuan Kernel ${{ github.event.inputs.version }} (All-Feature Unlocked)
+          files: dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
