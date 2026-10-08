@@ -55,42 +55,63 @@ jobs:
           python3 - << 'EOF'
           import re
 
+          # 1. Patch kernel/model/conf.go
           conf_path = "kernel/model/conf.go"
           with open(conf_path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          # 1. 穿透 IsSubscriber
+          # 穿透 IsSubscriber
           content = re.sub(
               r'func IsSubscriber\(\) bool \{[\s\S]*?\n\}',
               'func IsSubscriber() bool {\n\treturn true\n}',
               content
           )
 
-          # 2. 穿透 IsPaidUser (精确匹配到紧随其后的 const 声明，避免嵌套大括号过早截断)
+          # 穿透 IsPaidUser (精确匹配到紧随其后的 const 声明)
           content = re.sub(
               r'func IsPaidUser\(\) bool \{[\s\S]*?\n\}\n\nconst \(',
               'func IsPaidUser() bool {\n\treturn true\n}\n\nconst (',
               content
           )
 
-          # 3. 拦截 GetUser 方法注入永久 VIP 实体 (接收器重命名为 c 避免遮蔽 package conf 命名空间)
+          # 注入完整的 VIP 用户实体结构（关键：UserTitles 为空切片而不是 nil，防止前端崩溃）
           user_patch = """func (c *AppConf) GetUser() *conf.User {
           \tc.userLock.Lock()
           \tdefer c.userLock.Unlock()
           \tif c.User == nil {
           \t\tc.User = &conf.User{
-          \t\t\tUserId: "1",
-          \t\t\tUserName: "LocalVIP",
-          \t\t\tUserSiYuanProExpireTime: -1,
-          \t\t\tUserSiYuanSubscriptionStatus: 0,
-          \t\t\tUserSiYuanSubscriptionPlan: 0,
-          \t\t\tUserSiYuanSubscriptionType: 1,
-          \t\t\tUserSiYuanOneTimePayStatus: 1,
+          \t\t\tUserId:                          "1",
+          \t\t\tUserName:                        "LocalVIP",
+          \t\t\tUserAvatarURL:                   "",
+          \t\t\tUserHomeBImgURL:                 "",
+          \t\t\tUserTitles:                      []*conf.UserTitle{},
+          \t\t\tUserIntro:                       "",
+          \t\t\tUserNickname:                    "VIP",
+          \t\t\tUserCreateTime:                  "2026-01-01 00:00:00",
+          \t\t\tUserSiYuanProExpireTime:         -1,
+          \t\t\tUserToken:                       "local_unlocked_token",
+          \t\t\tUserTokenExpireTime:             "9999999999",
+          \t\t\tUserSiYuanRepoSize:              1024 * 1024 * 1024 * 1024,
+          \t\t\tUserSiYuanPointExchangeRepoSize: 0,
+          \t\t\tUserSiYuanAssetSize:             0,
+          \t\t\tUserTrafficUpload:               0,
+          \t\t\tUserTrafficDownload:             0,
+          \t\t\tUserTrafficAPIGet:               0,
+          \t\t\tUserTrafficAPIPut:               0,
+          \t\t\tUserTrafficTime:                 0,
+          \t\t\tUserSiYuanSubscriptionPlan:      0,
+          \t\t\tUserSiYuanSubscriptionStatus:    0,
+          \t\t\tUserSiYuanSubscriptionType:      1,
+          \t\t\tUserSiYuanOneTimePayStatus:      1,
           \t\t}
           \t} else {
           \t\tc.User.UserSiYuanProExpireTime = -1
           \t\tc.User.UserSiYuanSubscriptionStatus = 0
           \t\tc.User.UserSiYuanOneTimePayStatus = 1
+          \t\tc.User.UserSiYuanSubscriptionType = 1
+          \t\tif c.User.UserTitles == nil {
+          \t\t\tc.User.UserTitles = []*conf.UserTitle{}
+          \t\t}
           \t}
           \treturn c.User
           }"""
@@ -104,12 +125,48 @@ jobs:
           with open(conf_path, "w", encoding="utf-8") as f:
               f.write(content)
 
+          # 2. Patch kernel/model/cloud_service.go
+          # 拦截 GetCloudUser 和 RefreshUser，防止前端向 ld246.com 请求失败后将 user 重置为 null
+          cloud_path = "kernel/model/cloud_service.go"
+          with open(cloud_path, "r", encoding="utf-8") as f:
+              cloud_content = f.read()
+
+          cloud_content = re.sub(
+              r'func GetCloudUser\(token string, cached bool\) \(\*conf\.User, error\) \{[\s\S]*?\n\}',
+              'func GetCloudUser(token string, cached bool) (*conf.User, error) {\n\treturn Conf.GetUser(), nil\n}',
+              cloud_content
+          )
+
+          cloud_content = re.sub(
+              r'func RefreshUser\(token string\) \(ret \*conf\.User, err error\) \{[\s\S]*?\nfunc UseActivationcode',
+              'func RefreshUser(token string) (ret *conf.User, err error) {\n\treturn Conf.GetUser(), nil\n}\n\nfunc UseActivationcode',
+              cloud_content
+          )
+
+          with open(cloud_path, "w", encoding="utf-8") as f:
+              f.write(cloud_content)
+
+          # 3. Patch kernel/api/setting_contract.go
+          # 确保 settingUserPayload 在返回给前端时，UserTitles 永远是 [] 而不是 null
+          setting_path = "kernel/api/setting_contract.go"
+          with open(setting_path, "r", encoding="utf-8") as f:
+              setting_content = f.read()
+
+          target = "\tif value.UserTitles != nil {\n\t\tresult.UserTitles = make([]*apicontract.SettingUserTitle, len(value.UserTitles))\n\t\tfor i, item := range value.UserTitles {\n\t\t\tresult.UserTitles[i] = settingUserTitlePayload(item)\n\t\t}\n\t}"
+          replacement = "\tif value.UserTitles != nil {\n\t\tresult.UserTitles = make([]*apicontract.SettingUserTitle, len(value.UserTitles))\n\t\tfor i, item := range value.UserTitles {\n\t\t\tresult.UserTitles[i] = settingUserTitlePayload(item)\n\t\t}\n\t} else {\n\t\tresult.UserTitles = []*apicontract.SettingUserTitle{}\n\t}"
+          setting_content = setting_content.replace(target, replacement)
+
+          with open(setting_path, "w", encoding="utf-8") as f:
+              f.write(setting_content)
+
           print("Successfully applied VIP & WebDAV unlock patches.")
           EOF
 
       - name: Verify Patches
         run: |
           git diff kernel/model/conf.go
+          git diff kernel/model/cloud_service.go
+          git diff kernel/api/setting_contract.go
 
       - name: Compile Kernel
         working-directory: kernel
