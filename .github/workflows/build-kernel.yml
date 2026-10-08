@@ -125,8 +125,7 @@ jobs:
           with open(conf_path, "w", encoding="utf-8") as f:
               f.write(content)
 
-          # 2. Patch kernel/model/cloud_service.go
-          # 拦截 GetCloudUser 和 RefreshUser，防止前端向 ld246.com 请求失败后将 user 重置为 null
+          # 2. Patch kernel/model/cloud_service.go: 仅拦截 GetCloudUser，防止向 ld246.com 刷新失败后将 user 置空
           cloud_path = "kernel/model/cloud_service.go"
           with open(cloud_path, "r", encoding="utf-8") as f:
               cloud_content = f.read()
@@ -134,12 +133,6 @@ jobs:
           cloud_content = re.sub(
               r'func GetCloudUser\(token string, cached bool\) \(\*conf\.User, error\) \{[\s\S]*?\n\}',
               'func GetCloudUser(token string, cached bool) (*conf.User, error) {\n\treturn Conf.GetUser(), nil\n}',
-              cloud_content
-          )
-
-          cloud_content = re.sub(
-              r'func RefreshUser\(token string\) \(ret \*conf\.User, err error\) \{[\s\S]*?\nfunc UseActivationcode',
-              'func RefreshUser(token string) (ret *conf.User, err error) {\n\treturn Conf.GetUser(), nil\n}\n\nfunc UseActivationcode',
               cloud_content
           )
 
